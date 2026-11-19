@@ -146,3 +146,22 @@ def test_fastapi_endpoints_with_mocked_agent(monkeypatch: pytest.MonkeyPatch) ->
     data = resp.json()
     assert data["status"] == "RED"
     assert data["risk_score"] >= 70
+
+
+def test_rag_retriever_display_name_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("VERTEX_RAG_CORPUS", "")
+    monkeypatch.setenv("VERTEX_RAG_CORPUS_DISPLAY_NAME", "enterprise-agent-policies")
+    monkeypatch.setenv("VERTEX_RAG_REGION", "europe-west3")
+    monkeypatch.setenv("GCP_PROJECT_ID", "gcp-agent-platform-2026")
+
+    retriever = VertexRagRetriever()
+    assert retriever.corpus_display_name == "enterprise-agent-policies"
+    assert retriever.region == "europe-west3"
+
+    async def _fail_api(_query: str, top_k: int) -> list[dict[str, Any]]:
+        raise RuntimeError("offline in unit test")
+
+    monkeypatch.setattr(retriever, "_query_vertex_rag_api", _fail_api)
+    results = asyncio.run(retriever.retrieve("GCP Cloud Run", top_k=2))
+    assert len(results) == 2
+    assert all(item["backend"] == "local_fallback" for item in results)

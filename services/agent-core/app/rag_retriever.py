@@ -65,10 +65,23 @@ class VertexRagRetriever:
         corpus_name: str | None = None,
         region: str | None = None,
         policy_dir: str | None = None,
+        corpus_display_name: str | None = None,
     ) -> None:
-        self.corpus_name = (corpus_name or os.getenv("VERTEX_RAG_CORPUS", "")).strip()
-        self.region = (region or os.getenv("GCP_REGION", "europe-west3")).strip()
+        self.corpus_name = (
+            corpus_name if corpus_name is not None else os.getenv("VERTEX_RAG_CORPUS", "")
+        ).strip()
+        self.corpus_display_name = (
+            corpus_display_name
+            if corpus_display_name is not None
+            else os.getenv("VERTEX_RAG_CORPUS_DISPLAY_NAME", "")
+        ).strip()
+        self.region = (
+            region or os.getenv("VERTEX_RAG_REGION") or os.getenv("GCP_REGION", "europe-west3")
+        ).strip()
         self.policy_dir = policy_dir or os.getenv("POLICY_SEED_DIR", "")
+        self.project_id = (
+            os.getenv("GCP_PROJECT_ID") or os.getenv("GOOGLE_CLOUD_PROJECT", "")
+        ).strip()
 
     def _load_local_policies(self) -> list[dict[str, str]]:
         """Load markdown policy files from disk if available, otherwise return built-in snippets."""
@@ -97,21 +110,53 @@ class VertexRagRetriever:
 
         return list(BUILTIN_POLICIES)
 
+    async def _resolve_corpus_name(self, token: str) -> str:
+        """Resolve Vertex AI RAG Corpus resource name by display name and cache it."""
+        if self.corpus_name:
+            return self.corpus_name
+        if not self.corpus_display_name or not self.project_id:
+            return ""
+
+        base = f"https://{self.region}-aiplatform.googleapis.com/v1beta1"
+        parent = f"projects/{self.project_id}/locations/{self.region}"
+        headers = {"Authorization": f"Bearer {token}"}
+        page_token = ""
+
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            while True:
+                params = {"pageToken": page_token} if page_token else None
+                resp = await client.get(f"{base}/{parent}/ragCorpora", params=params, headers=headers)
+                resp.raise_for_status()
+                data = resp.json()
+                for corpus in data.get("ragCorpora", []):
+                    if corpus.get("displayName") == self.corpus_display_name and corpus.get("name"):
+                        self.corpus_name = corpus["name"]
+                        return self.corpus_name
+                page_token = data.get("nextPageToken", "")
+                if not page_token:
+                    return ""
+
     async def _query_vertex_rag_api(self, query_text: str, top_k: int) -> list[dict[str, Any]]:
         """Call Vertex AI RAG retrieveContexts REST API using ADC credentials."""
         import google.auth
         from google.auth.transport.requests import Request as AuthRequest
 
-        credentials, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
+        credentials, detected_project = google.auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
         credentials.refresh(AuthRequest())
+        if not self.project_id and detected_project:
+            self.project_id = detected_project
 
-        project_part = self.corpus_name.split("/")[1] if self.corpus_name.startswith("projects/") else os.getenv("GCP_PROJECT_ID", "")
+        corpus_name = await self._resolve_corpus_name(credentials.token)
+        if not corpus_name:
+            return []
+
+        project_part = corpus_name.split("/")[1] if corpus_name.startswith("projects/") else self.project_id
         parent = f"projects/{project_part}/locations/{self.region}"
         url = f"https://{self.region}-aiplatform.googleapis.com/v1beta1/{parent}:retrieveContexts"
 
         payload = {
             "vertexRagStore": {
-                "ragResources": [{"ragCorpus": self.corpus_name}],
+                "ragResources": [{"ragCorpus": corpus_name}],
             },
             "query": {
                 "text": query_text[:2000],
@@ -166,7 +211,7 @@ class VertexRagRetriever:
 
     async def retrieve(self, query_text: str, top_k: int = 4) -> list[dict[str, Any]]:
         """Retrieve the top-k matching enterprise policy passages for an RFP query."""
-        if self.corpus_name:
+        if self.corpus_name or self.corpus_display_name:
             try:
                 results = await self._query_vertex_rag_api(query_text, top_k=top_k)
                 if results:

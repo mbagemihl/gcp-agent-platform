@@ -1,1 +1,118 @@
-# Baut & pusht Docker-Images in Artifact Registry
+name: Build, Scan & Push Service Images
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'services/**'
+      - '.github/workflows/build-images.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  test:
+    name: Unit Tests & Frontend Build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install Python dependencies & run service tests
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r services/mcp-pricing-server/requirements.txt -r services/agent-core/requirements.txt
+          PYTHONPATH=services/mcp-pricing-server pytest services/mcp-pricing-server/tests -v
+          PYTHONPATH=services/agent-core pytest services/agent-core/tests -v
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: services/showcase-ui/package-lock.json
+
+      - name: Build showcase-ui frontend
+        working-directory: services/showcase-ui
+        env:
+          ASTRO_TELEMETRY_DISABLED: '1'
+        run: |
+          npm ci
+          npm run build
+
+  build-scan-push:
+    name: Build, Scan & Push (${{ matrix.service }})
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        service:
+          - mcp-pricing-server
+          - agent-core
+          - showcase-ui
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Authenticate to GCP via Workload Identity Federation
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up gcloud CLI
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker for Artifact Registry
+        run: |
+          gcloud auth configure-docker "${{ vars.GCP_REGION }}-docker.pkg.dev" --quiet
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build container image (linux/amd64)
+        env:
+          IMAGE_BASE: ${{ vars.GCP_ARTIFACT_REGISTRY }}/${{ matrix.service }}
+          IMAGE_SHA: ${{ vars.GCP_ARTIFACT_REGISTRY }}/${{ matrix.service }}:${{ github.sha }}
+          IMAGE_LATEST: ${{ vars.GCP_ARTIFACT_REGISTRY }}/${{ matrix.service }}:latest
+        run: |
+          docker buildx build \
+            --platform linux/amd64 \
+            --load \
+            -t "$IMAGE_SHA" \
+            -t "$IMAGE_LATEST" \
+            "services/${{ matrix.service }}"
+
+      - name: Scan container image with Trivy
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: '${{ vars.GCP_ARTIFACT_REGISTRY }}/${{ matrix.service }}:${{ github.sha }}'
+          format: 'table'
+          exit-code: '0'
+          ignore-unfixed: true
+          severity: 'HIGH,CRITICAL'
+
+      - name: Push image tags (Git SHA & latest) to Artifact Registry
+        env:
+          IMAGE_SHA: ${{ vars.GCP_ARTIFACT_REGISTRY }}/${{ matrix.service }}:${{ github.sha }}
+          IMAGE_LATEST: ${{ vars.GCP_ARTIFACT_REGISTRY }}/${{ matrix.service }}:latest
+        run: |
+          docker push "$IMAGE_SHA"
+          docker push "$IMAGE_LATEST"
+
+          {
+            echo "### \`${{ matrix.service }}\` pushed to Artifact Registry"
+            echo "- \`$IMAGE_SHA\`"
+            echo "- \`$IMAGE_LATEST\`"
+          } >> "$GITHUB_STEP_SUMMARY"

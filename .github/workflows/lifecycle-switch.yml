@@ -1,1 +1,158 @@
-# 1-Klick UP (apply) & DOWN (destroy) für Layer 1
+name: Layer 1 Lifecycle Switch (UP / DOWN)
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Lifecycle action: UP (deploy & seed) or DOWN (destroy & verify)'
+        type: choice
+        options:
+          - UP
+          - DOWN
+        required: true
+      image_tag:
+        description: 'Container image tag to deploy on UP'
+        type: string
+        default: 'latest'
+        required: false
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: layer1-lifecycle
+  cancel-in-progress: false
+
+jobs:
+  lifecycle:
+    name: Layer 1 Platform ${{ inputs.action }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Authenticate to GCP via Workload Identity Federation
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up gcloud CLI
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Set up Python 3.13 for Vertex AI RAG Seeding
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install Python GCP auth dependency
+        run: |
+          python -m pip install --quiet google-auth
+
+      - name: Set up Terraform 1.17.2
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: '1.17.2'
+          terraform_wrapper: false
+
+      - name: Terraform Init (Layer 1)
+        working-directory: infra/layer1-platform
+        run: |
+          terraform init -input=false
+
+      - name: Terraform Apply (UP)
+        if: ${{ inputs.action == 'UP' }}
+        working-directory: infra/layer1-platform
+        run: |
+          terraform apply -auto-approve -input=false \
+            -var="project_id=${{ vars.GCP_PROJECT_ID }}" \
+            -var="region=${{ vars.GCP_REGION }}" \
+            -var="image_tag=${{ inputs.image_tag }}"
+
+      - name: Verify Live Health & Write Step Summary (UP)
+        if: ${{ inputs.action == 'UP' }}
+        working-directory: infra/layer1-platform
+        run: |
+          SHOWCASE_UI_URL=$(terraform output -raw showcase_ui_url)
+          AGENT_CORE_URL=$(terraform output -raw agent_core_url)
+          MCP_SERVER_URL=$(terraform output -raw mcp_pricing_server_url)
+          CLOUD_TRACE_URL=$(terraform output -raw cloud_trace_dashboard_url)
+          RAG_BUCKET=$(terraform output -raw rag_documents_bucket_name)
+          RAG_CORPUS=$(terraform output -raw rag_corpus_display_name)
+
+          echo "Checking Showcase UI health endpoint: ${SHOWCASE_UI_URL}/api/health"
+          HEALTH_OK=0
+          for i in $(seq 1 12); do
+            if curl -fsS "${SHOWCASE_UI_URL}/api/health"; then
+              echo ""
+              HEALTH_OK=1
+              break
+            fi
+            sleep 5
+          done
+          if [ "$HEALTH_OK" -ne 1 ]; then
+            echo "ERROR: Showcase UI health check failed after retries."
+            exit 1
+          fi
+
+          {
+            echo "## GCP Enterprise Agent Platform – Layer 1 UP"
+            echo ""
+            echo "| Component | Value |"
+            echo "| --- | --- |"
+            echo "| **Showcase UI (Public)** | ${SHOWCASE_UI_URL} |"
+            echo "| **Agent Core (Internal)** | \`${AGENT_CORE_URL}\` |"
+            echo "| **MCP Pricing Server (Internal)** | \`${MCP_SERVER_URL}\` |"
+            echo "| **Cloud Trace Dashboard** | ${CLOUD_TRACE_URL} |"
+            echo "| **RAG Documents Bucket** | \`gs://${RAG_BUCKET}\` |"
+            echo "| **Vertex AI RAG Corpus** | \`${RAG_CORPUS}\` |"
+            echo "| **Deployed Image Tag** | \`${{ inputs.image_tag }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Terraform Destroy (DOWN)
+        if: ${{ inputs.action == 'DOWN' }}
+        working-directory: infra/layer1-platform
+        run: |
+          terraform destroy -auto-approve -input=false \
+            -var="project_id=${{ vars.GCP_PROJECT_ID }}" \
+            -var="region=${{ vars.GCP_REGION }}" \
+            -var="image_tag=${{ inputs.image_tag }}"
+
+      - name: Verify Clean Teardown (Cloud Run & Vertex AI RAG)
+        if: ${{ inputs.action == 'DOWN' }}
+        env:
+          PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          REGION: ${{ vars.GCP_REGION }}
+        run: |
+          ACTIVE_RUN_SERVICES=$(gcloud run services list \
+            --project="$PROJECT_ID" \
+            --region="$REGION" \
+            --format="value(metadata.name)")
+
+          if [ -n "$ACTIVE_RUN_SERVICES" ]; then
+            echo "ERROR: Cloud Run services still present after destroy:"
+            echo "$ACTIVE_RUN_SERVICES"
+            exit 1
+          fi
+
+          ACCESS_TOKEN=$(gcloud auth print-access-token)
+          RAG_CORPORA_JSON=$(curl -fsS \
+            -H "Authorization: Bearer ${ACCESS_TOKEN}" \
+            "https://${REGION}-aiplatform.googleapis.com/v1beta1/projects/${PROJECT_ID}/locations/${REGION}/ragCorpora")
+
+          RAG_COUNT=$(python -c 'import json,sys; d=json.loads(sys.argv[1]); print(len(d.get("ragCorpora", [])))' "$RAG_CORPORA_JSON")
+          if [ "$RAG_COUNT" -ne 0 ]; then
+            echo "ERROR: Vertex AI RAG corpora still present after destroy:"
+            echo "$RAG_CORPORA_JSON"
+            exit 1
+          fi
+
+          {
+            echo "## GCP Enterprise Agent Platform – Layer 1 DOWN"
+            echo ""
+            echo "- Cloud Run Services in \`${REGION}\`: **0 active**"
+            echo "- Vertex AI RAG Corpora in \`${REGION}\`: **0 active**"
+            echo "- Layer 0 Permanent Bootstrap & Artifact Registry: **Preserved**"
+          } >> "$GITHUB_STEP_SUMMARY"

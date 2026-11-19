@@ -9,6 +9,7 @@ locals {
     "cloudresourcemanager.googleapis.com",
     "firestore.googleapis.com",
     "cloudtrace.googleapis.com",
+    "compute.googleapis.com",
   ])
 
   github_deployer_roles = toset([
@@ -21,6 +22,8 @@ locals {
     "roles/iam.serviceAccountUser",
     "roles/resourcemanager.projectIamAdmin",
     "roles/serviceusage.serviceUsageConsumer",
+    "roles/serviceusage.serviceUsageAdmin",
+    "roles/compute.networkUser",
   ])
 
   state_bucket_name = coalesce(var.tf_state_bucket_name, "${var.project_id}-tfstate-layer1")
@@ -129,4 +132,25 @@ resource "google_service_account_iam_member" "github_wif_binding" {
   service_account_id = google_service_account.github_actions.name
   role               = "roles/iam.workloadIdentityUser"
   member             = "principalSet://iam.googleapis.com/${google_iam_workload_identity_pool.github_pool.name}/attribute.repository/${local.github_repository}"
+}
+
+# 5. Permanent $0 VPC + Subnet with Private Google Access for Cloud Run Direct VPC Egress
+resource "google_compute_network" "agent_vpc" {
+  project                 = var.project_id
+  name                    = "agent-platform-vpc"
+  auto_create_subnetworks = false
+  description             = "Permanent VPC for Cloud Run Direct VPC Egress to internal-only services"
+
+  depends_on = [
+    google_project_service.apis["compute.googleapis.com"],
+  ]
+}
+
+resource "google_compute_subnetwork" "agent_subnet" {
+  project                  = var.project_id
+  name                     = "agent-platform-subnet"
+  region                   = var.region
+  network                  = google_compute_network.agent_vpc.id
+  ip_cidr_range            = "10.10.0.0/24"
+  private_ip_google_access = true
 }

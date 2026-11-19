@@ -27,3 +27,13 @@ output "github_actions_service_account_email" {
   description = "Email of the GitHub Actions deployer Service Account"
   value       = google_service_account.github_actions.email
 }
+
+output "vpc_network_name" {
+  description = "VPC network name for Cloud Run Direct VPC Egress"
+  value       = google_compute_network.agent_vpc.name
+}
+
+output "vpc_subnetwork_name" {
+  description = "VPC subnetwork name with Private Google Access"
+  value       = google_compute_subnetwork.agent_subnet.name
+}
