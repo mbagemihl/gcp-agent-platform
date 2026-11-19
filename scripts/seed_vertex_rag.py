@@ -181,6 +181,8 @@ def _ensure_rag_bucket_reader(bucket: str, project_number: str, token: str) -> b
 
         try:
             _http_json("PUT", iam_url, token, payload=policy)
+            # Allow GCS IAM policy binding to propagate before importing into Vertex AI RAG.
+            time.sleep(10)
             return True
         except RuntimeError as exc:
             if "does not exist" in str(exc) and attempt < 5:
@@ -214,10 +216,12 @@ def _build_import_payload(gcs_uris: list[str], chunk_size: int, chunk_overlap: i
     return {
         "importRagFilesConfig": {
             "gcsSource": {"uris": gcs_uris},
-            "ragFileChunkingConfig": {
-                "fixedLengthChunking": {
-                    "chunkSize": chunk_size,
-                    "chunkOverlap": chunk_overlap,
+            "ragFileTransformationConfig": {
+                "ragFileChunkingConfig": {
+                    "fixedLengthChunking": {
+                        "chunkSize": chunk_size,
+                        "chunkOverlap": chunk_overlap,
+                    }
                 }
             },
         }
@@ -235,10 +239,26 @@ def _import_rag_files(
     """Import policy files from GCS into the Vertex AI RAG Corpus and wait for indexing."""
     base = f"https://{region}-aiplatform.googleapis.com/v1beta1"
     payload = _build_import_payload(gcs_uris, chunk_size, chunk_overlap)
-    op = _http_json("POST", f"{base}/{corpus_name}:importRagFiles", token, payload=payload)
-    if op.get("name") and not op.get("done"):
-        op = _poll_lro(region, op["name"], token, timeout_seconds=600)
-    return op
+    import_url = f"{base}/{corpus_name}/ragFiles:import"
+
+    last_op: dict[str, Any] = {}
+    for attempt in range(1, 4):
+        op = _http_json("POST", import_url, token, payload=payload)
+        if op.get("name") and not op.get("done"):
+            op = _poll_lro(region, op["name"], token, timeout_seconds=600)
+        last_op = op
+
+        resp = op.get("response", {})
+        failed_count = int(resp.get("failedRagFilesCount", 0) or 0)
+        imported_count = int(resp.get("importedRagFilesCount", 0) or 0)
+        if failed_count == 0:
+            return op
+        if imported_count == 0 and attempt < 3:
+            time.sleep(10)
+            continue
+        raise RuntimeError(f"Vertex AI RAG file import reported failures: {json.dumps(resp)}")
+
+    return last_op
 
 
 def _list_rag_files(region: str, corpus_name: str, token: str) -> list[dict[str, Any]]:
