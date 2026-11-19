@@ -157,6 +157,40 @@ def _create_corpus(
     return created
 
 
+def _ensure_rag_bucket_reader(bucket: str, project_number: str, token: str) -> bool:
+    """Grant roles/storage.objectViewer on bucket to the Vertex RAG service agent idempotently."""
+    if not bucket or not project_number:
+        return False
+
+    member = f"serviceAccount:service-{project_number}@gcp-sa-vertex-rag.iam.gserviceaccount.com"
+    role = "roles/storage.objectViewer"
+    iam_url = f"https://storage.googleapis.com/storage/v1/b/{urllib.parse.quote(bucket, safe='')}/iam"
+
+    for attempt in range(6):
+        policy = _http_json("GET", iam_url, token)
+        bindings = policy.get("bindings", [])
+        target_binding = next((b for b in bindings if b.get("role") == role), None)
+        if target_binding and member in target_binding.get("members", []):
+            return True
+
+        if target_binding is not None:
+            target_binding.setdefault("members", []).append(member)
+        else:
+            bindings.append({"role": role, "members": [member]})
+        policy["bindings"] = bindings
+
+        try:
+            _http_json("PUT", iam_url, token, payload=policy)
+            return True
+        except RuntimeError as exc:
+            if "does not exist" in str(exc) and attempt < 5:
+                time.sleep(5)
+                continue
+            raise
+
+    return False
+
+
 def _list_gcs_policy_uris(bucket: str, prefix: str, token: str) -> list[str]:
     """List policy document gs:// URIs in the configured GCS bucket prefix."""
     cleaned_prefix = prefix.strip("/")
@@ -234,6 +268,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Manage & seed Vertex AI RAG Corpus from GCS policies.")
     parser.add_argument("--action", choices=("seed", "status", "destroy"), default="seed")
     parser.add_argument("--project-id", default=os.getenv("GCP_PROJECT_ID", ""))
+    parser.add_argument("--project-number", default=os.getenv("GCP_PROJECT_NUMBER", ""))
     parser.add_argument("--region", default=os.getenv("GCP_REGION", "europe-west3"))
     parser.add_argument("--corpus-display-name", default="enterprise-agent-policies")
     parser.add_argument("--embedding-model", default="text-embedding-005")
@@ -315,6 +350,15 @@ def main(argv: list[str] | None = None) -> int:
         created_now = True
 
     corpus_name = corpus["name"]
+    project_number = args.project_number.strip()
+    if not project_number and corpus_name.startswith("projects/"):
+        candidate = corpus_name.split("/")[1]
+        if candidate.isdigit():
+            project_number = candidate
+
+    if args.gcs_bucket and project_number:
+        _ensure_rag_bucket_reader(args.gcs_bucket, project_number, token)
+
     uris = _list_gcs_policy_uris(args.gcs_bucket, args.gcs_prefix, token) if args.gcs_bucket else []
     if not uris:
         print(
