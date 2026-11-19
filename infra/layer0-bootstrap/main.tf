@@ -10,6 +10,7 @@ locals {
     "firestore.googleapis.com",
     "cloudtrace.googleapis.com",
     "compute.googleapis.com",
+    "billingbudgets.googleapis.com",
   ])
 
   github_deployer_roles = toset([
@@ -153,4 +154,45 @@ resource "google_compute_subnetwork" "agent_subnet" {
   network                  = google_compute_network.agent_vpc.id
   ip_cidr_range            = "10.10.0.0/24"
   private_ip_google_access = true
+}
+
+# 6. FinOps Budget Alert (5 EUR / 10 EUR / 20 EUR)
+data "google_project" "current" {
+  project_id = var.project_id
+}
+
+resource "google_billing_budget" "project_budget" {
+  provider        = google.billing
+  billing_account = var.billing_account_id
+  display_name    = "GCP Agent Platform FinOps Budget (5/10/20 EUR)"
+
+  budget_filter {
+    projects = ["projects/${data.google_project.current.number}"]
+  }
+
+  amount {
+    specified_amount {
+      currency_code = "EUR"
+      units         = tostring(var.monthly_budget_eur)
+    }
+  }
+
+  threshold_rules {
+    threshold_percent = 0.25
+    spend_basis       = "CURRENT_SPEND"
+  }
+
+  threshold_rules {
+    threshold_percent = 0.5
+    spend_basis       = "CURRENT_SPEND"
+  }
+
+  threshold_rules {
+    threshold_percent = 1.0
+    spend_basis       = "CURRENT_SPEND"
+  }
+
+  depends_on = [
+    google_project_service.apis["billingbudgets.googleapis.com"],
+  ]
 }

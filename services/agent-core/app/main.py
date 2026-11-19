@@ -10,7 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from app.agent import EnterpriseRfpAgent
+from app.agent import DEFAULT_MODEL, EnterpriseRfpAgent
 
 app = FastAPI(title="Enterprise Agent Core", version="1.0.0")
 
@@ -31,7 +31,7 @@ class AnalyzeRequest(BaseModel):
         default="Bewerte Machbarkeit, Compliance-Risiken und benötigte Tagessätze.",
         min_length=1,
     )
-    model_name: str = Field(default="gemini-2.5-flash")
+    model_name: str = Field(default=DEFAULT_MODEL)
 
 
 @app.get("/health")

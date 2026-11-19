@@ -20,7 +20,7 @@ const BUILTIN_SAMPLE_RFPS: SampleRfp[] = [
 
 1. Zielsetzung & Architektur
 Der Auftraggeber sucht einen Partner für den Aufbau einer KI-gestützten Kundenanalyse-Plattform auf Google Cloud Platform (GCP) in der Region europe-west3 (Frankfurt).
-- Compute & Services: Cloud Run, Vertex AI (Gemini 2.5 Flash / Pro), Cloud Firestore und BigQuery.
+- Compute & Services: Cloud Run, Vertex AI (Gemini 3.8 Flash / 3.1 Pro), Cloud Firestore und BigQuery.
 - Infrastruktur: Bereitstellung reproduzierbar via Terraform und GitHub Actions CI/CD (Workload Identity Federation).
 
 2. Sicherheit, Datenschutz & Lizenzierung

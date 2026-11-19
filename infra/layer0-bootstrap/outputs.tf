@@ -37,3 +37,8 @@ output "vpc_subnetwork_name" {
   description = "VPC subnetwork name with Private Google Access"
   value       = google_compute_subnetwork.agent_subnet.name
 }
+
+output "billing_budget_name" {
+  description = "GCP Billing Budget resource name for 5/10/20 EUR alerts"
+  value       = google_billing_budget.project_budget.name
+}

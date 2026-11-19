@@ -119,6 +119,10 @@ resource "google_cloud_run_v2_service" "agent_core" {
         value = "true"
       }
       env {
+        name  = "VERTEX_LLM_LOCATION"
+        value = "global"
+      }
+      env {
         name  = "VERTEX_RAG_CORPUS_DISPLAY_NAME"
         value = var.rag_corpus_display_name
       }

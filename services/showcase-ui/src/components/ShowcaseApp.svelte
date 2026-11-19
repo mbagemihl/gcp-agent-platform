@@ -47,7 +47,7 @@
   let rfpTitle = $state('FinTech Data & AI Platform (GCP Cloud-Native)');
   let rfpText = $state('');
   let userQuery = $state('Bewerte Machbarkeit, Compliance-Risiken und benötigte Tagessätze.');
-  let modelName = $state<'gemini-2.5-flash' | 'gemini-2.5-pro'>('gemini-2.5-flash');
+  let modelName = $state<'gemini-3.8-flash' | 'gemini-3.1-pro-preview' | 'gemini-3.5-flash-lite'>('gemini-3.8-flash');
   let includeRawTraceIds = $state(true);
 
   let isRunning = $state(false);
@@ -246,8 +246,9 @@
           <div class="field">
             <label for="model-select">Vertex AI Modell</label>
             <select id="model-select" bind:value={modelName}>
-              <option value="gemini-2.5-flash">gemini-2.5-flash</option>
-              <option value="gemini-2.5-pro">gemini-2.5-pro</option>
+              <option value="gemini-3.8-flash">gemini-3.8-flash</option>
+              <option value="gemini-3.1-pro-preview">gemini-3.1-pro-preview</option>
+              <option value="gemini-3.5-flash-lite">gemini-3.5-flash-lite</option>
             </select>
           </div>
         </div>

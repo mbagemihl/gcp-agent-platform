@@ -8,7 +8,7 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 
-from app.agent import EnterpriseRfpAgent
+from app.agent import EnterpriseRfpAgent, resolve_model_name
 from app.main import app
 from app.prompts import build_analysis_prompt, evaluate_policy_risk
 from app.rag_retriever import VertexRagRetriever
@@ -115,9 +115,14 @@ def test_rag_retriever_and_full_agent_pipeline(monkeypatch: pytest.MonkeyPatch) 
             model_name="gemini-2.5-flash",
         )
     )
+    assert result["model"] == "gemini-3.8-flash"
+    assert resolve_model_name("gemini-2.5-pro") == "gemini-3.1-pro-preview"
+    assert resolve_model_name("gemini-3.8-flash") == "gemini-3.8-flash"
     assert result["status"] == "GREEN"
     assert result["risk_score"] < 40
     assert len(result["steps"]) >= 4
+    trace_ids = {step["trace_id"] for step in result["steps"]}
+    assert trace_ids == {result["trace_id"]}
     assert any(call["tool"] == "submit_compliance_report" for call in result["mcp_calls"])
     assert result["token_usage"]["total_tokens"] > 0
 

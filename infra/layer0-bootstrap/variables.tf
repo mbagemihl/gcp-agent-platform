@@ -33,3 +33,15 @@ variable "tf_state_bucket_name" {
   type        = string
   default     = ""
 }
+
+variable "billing_account_id" {
+  description = "GCP Billing Account ID for FinOps Budget Alerts"
+  type        = string
+  default     = "01A44C-EB29CE-4771C9"
+}
+
+variable "monthly_budget_eur" {
+  description = "Monthly project budget cap in EUR (thresholds at 25%=5 EUR, 50%=10 EUR, 100%=20 EUR)"
+  type        = number
+  default     = 20
+}

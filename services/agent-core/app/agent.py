@@ -14,7 +14,19 @@ from app.telemetry import TraceSession
 
 logger = logging.getLogger(__name__)
 
-SUPPORTED_MODELS = ("gemini-2.5-flash", "gemini-2.5-pro")
+SUPPORTED_MODELS = ("gemini-3.8-flash", "gemini-3.1-pro-preview", "gemini-3.5-flash-lite")
+MODEL_ALIASES: dict[str, str] = {
+    "gemini-2.5-flash": "gemini-3.8-flash",
+    "gemini-2.5-pro": "gemini-3.1-pro-preview",
+}
+DEFAULT_MODEL = "gemini-3.8-flash"
+
+
+def resolve_model_name(requested: str) -> str:
+    """Map requested model ID (including retired 2.5 aliases) to an active Vertex AI model."""
+    cleaned = (requested or "").strip()
+    mapped = MODEL_ALIASES.get(cleaned, cleaned)
+    return mapped if mapped in SUPPORTED_MODELS else DEFAULT_MODEL
 
 
 class EnterpriseRfpAgent:
@@ -26,11 +38,13 @@ class EnterpriseRfpAgent:
         mcp_client: McpPricingClient | None = None,
         project_id: str | None = None,
         region: str | None = None,
+        llm_location: str | None = None,
     ) -> None:
         self.rag_retriever = rag_retriever or VertexRagRetriever()
         self.mcp_client = mcp_client or McpPricingClient()
         self.project_id = (project_id or os.getenv("GCP_PROJECT_ID") or os.getenv("GOOGLE_CLOUD_PROJECT", "")).strip()
         self.region = (region or os.getenv("GCP_REGION", "europe-west3")).strip()
+        self.llm_location = (llm_location or os.getenv("VERTEX_LLM_LOCATION", "global")).strip()
 
     def _call_vertex_gemini(self, model_name: str, prompt: str) -> tuple[str, int, int, str]:
         """Call Vertex AI Gemini via google-genai SDK or fall back to deterministic local synthesis."""
@@ -40,7 +54,7 @@ class EnterpriseRfpAgent:
                 from google import genai
                 from google.genai import types
 
-                client = genai.Client(vertexai=True, project=self.project_id, location=self.region)
+                client = genai.Client(vertexai=True, project=self.project_id, location=self.llm_location)
                 response = client.models.generate_content(
                     model=model_name,
                     contents=prompt,
@@ -125,102 +139,105 @@ class EnterpriseRfpAgent:
         rfp_title: str,
         rfp_text: str,
         user_query: str = "Bewerte Machbarkeit, Compliance-Risiken und benötigte Tagessätze.",
-        model_name: str = "gemini-2.5-flash",
+        model_name: str = DEFAULT_MODEL,
     ) -> AsyncIterator[dict[str, Any]]:
         """Run end-to-end RFP evaluation and yield live OpenTelemetry step events."""
-        chosen_model = model_name if model_name in SUPPORTED_MODELS else "gemini-2.5-flash"
+        chosen_model = resolve_model_name(model_name)
         session = TraceSession(model_name=chosen_model)
         mcp_calls: list[dict[str, Any]] = []
 
-        # Step 1: Vertex AI RAG Policy Retrieval
-        with session.record_step("rag_retrieval", "Vertex AI RAG: Enterprise Policies abrufen", {"top_k": 4}) as step:
-            rag_sources = await self.rag_retriever.retrieve(f"{rfp_title}\n{rfp_text}\n{user_query}", top_k=4)
-            step["details"]["sources_count"] = len(rag_sources)
-            step["details"]["backend"] = rag_sources[0]["backend"] if rag_sources else "none"
-            step["output"] = rag_sources
-        yield {"type": "step_completed", "step": step}
+        with session.start_root_span("agent.analyze_rfp", {"rfp_title": rfp_title, "model": chosen_model}):
+            # Step 1: Vertex AI RAG Policy Retrieval
+            with session.record_step("rag_retrieval", "Vertex AI RAG: Enterprise Policies abrufen", {"top_k": 4}) as step:
+                rag_sources = await self.rag_retriever.retrieve(f"{rfp_title}\n{rfp_text}\n{user_query}", top_k=4)
+                step["details"]["sources_count"] = len(rag_sources)
+                step["details"]["backend"] = rag_sources[0]["backend"] if rag_sources else "none"
+                step["output"] = rag_sources
+            yield {"type": "step_completed", "step": step}
 
-        # Step 2: Deterministic Policy Risk Pre-Check
-        with session.record_step("policy_risk_check", "Compliance- & Blocker-Regelprüfung") as step:
-            risk_assessment = evaluate_policy_risk(rfp_text, rag_sources)
-            step["details"]["risk_score"] = risk_assessment["risk_score"]
-            step["details"]["status"] = risk_assessment["status"]
-            step["output"] = risk_assessment
-        yield {"type": "step_completed", "step": step}
+            # Step 2: Deterministic Policy Risk Pre-Check
+            with session.record_step("policy_risk_check", "Compliance- & Blocker-Regelprüfung") as step:
+                risk_assessment = evaluate_policy_risk(rfp_text, rag_sources)
+                step["details"]["risk_score"] = risk_assessment["risk_score"]
+                step["details"]["status"] = risk_assessment["status"]
+                step["output"] = risk_assessment
+            yield {"type": "step_completed", "step": step}
 
-        # Step 3: MCP Tool Calls - get_role_rates for required roles
-        role_rates: list[dict[str, Any]] = []
-        for role in risk_assessment["required_roles"]:
-            req_payload = {"role": role}
-            with session.record_step("mcp_tool_call", f"MCP Tool: get_role_rates({role})", {"tool": "get_role_rates"}) as step:
-                rate_result = await self.mcp_client.get_role_rates(role)
-                role_rates.append(rate_result)
+            # Step 3: MCP Tool Calls - get_role_rates for required roles
+            role_rates: list[dict[str, Any]] = []
+            for role in risk_assessment["required_roles"]:
+                req_payload = {"role": role}
+                with session.record_step("mcp_tool_call", f"MCP Tool: get_role_rates({role})", {"tool": "get_role_rates"}) as step:
+                    rate_result = await self.mcp_client.get_role_rates(role)
+                    role_rates.append(rate_result)
+                    call_record = {
+                        "tool": "get_role_rates",
+                        "request": req_payload,
+                        "response": rate_result,
+                    }
+                    mcp_calls.append(call_record)
+                    step["output"] = call_record
+                yield {"type": "step_completed", "step": step}
+
+            # Step 4: LLM Synthesis via Vertex AI Gemini
+            prompt = build_analysis_prompt(
+                rfp_title=rfp_title,
+                rfp_text=rfp_text,
+                user_query=user_query,
+                rag_contexts=rag_sources,
+                role_rates=role_rates,
+                risk_assessment=risk_assessment,
+            )
+            with session.record_step("llm_generation", f"Vertex AI LLM: {chosen_model}", {"model": chosen_model}) as step:
+                llm_text, in_tok, out_tok, llm_backend = await asyncio.to_thread(
+                    self._call_vertex_gemini,
+                    chosen_model,
+                    prompt,
+                )
+                if not llm_text:
+                    llm_text = self._build_local_fallback_response(
+                        rfp_title=rfp_title,
+                        user_query=user_query,
+                        rag_sources=rag_sources,
+                        role_rates=role_rates,
+                        risk_assessment=risk_assessment,
+                    )
+                    out_tok = max(80, len(llm_text) // 4)
+
+                session.add_tokens(in_tok, out_tok)
+                step["details"]["backend"] = llm_backend
+                step["details"]["input_tokens"] = in_tok
+                step["details"]["output_tokens"] = out_tok
+                step["output"] = {"backend": llm_backend, "preview": llm_text[:240]}
+            yield {"type": "step_completed", "step": step}
+
+            # Step 5: MCP Tool Call - Persist Compliance Report in Firestore
+            summary_excerpt = llm_text.splitlines()[0] if llm_text else f"{risk_assessment['status']} ({risk_assessment['risk_score']}/100)"
+            report_req = {
+                "rfp_title": rfp_title,
+                "risk_score": risk_assessment["risk_score"],
+                "summary": summary_excerpt[:400],
+            }
+            with session.record_step(
+                "mcp_tool_call",
+                "MCP Tool: submit_compliance_report",
+                {"tool": "submit_compliance_report"},
+            ) as step:
+                report_res = await self.mcp_client.submit_compliance_report(
+                    rfp_title=report_req["rfp_title"],
+                    risk_score=report_req["risk_score"],
+                    summary=report_req["summary"],
+                )
                 call_record = {
-                    "tool": "get_role_rates",
-                    "request": req_payload,
-                    "response": rate_result,
+                    "tool": "submit_compliance_report",
+                    "request": report_req,
+                    "response": report_res,
                 }
                 mcp_calls.append(call_record)
                 step["output"] = call_record
             yield {"type": "step_completed", "step": step}
 
-        # Step 4: LLM Synthesis via Vertex AI Gemini
-        prompt = build_analysis_prompt(
-            rfp_title=rfp_title,
-            rfp_text=rfp_text,
-            user_query=user_query,
-            rag_contexts=rag_sources,
-            role_rates=role_rates,
-            risk_assessment=risk_assessment,
-        )
-        with session.record_step("llm_generation", f"Vertex AI LLM: {chosen_model}", {"model": chosen_model}) as step:
-            llm_text, in_tok, out_tok, llm_backend = await asyncio.to_thread(
-                self._call_vertex_gemini,
-                chosen_model,
-                prompt,
-            )
-            if not llm_text:
-                llm_text = self._build_local_fallback_response(
-                    rfp_title=rfp_title,
-                    user_query=user_query,
-                    rag_sources=rag_sources,
-                    role_rates=role_rates,
-                    risk_assessment=risk_assessment,
-                )
-                out_tok = max(80, len(llm_text) // 4)
-
-            session.add_tokens(in_tok, out_tok)
-            step["details"]["backend"] = llm_backend
-            step["details"]["input_tokens"] = in_tok
-            step["details"]["output_tokens"] = out_tok
-            step["output"] = {"backend": llm_backend, "preview": llm_text[:240]}
-        yield {"type": "step_completed", "step": step}
-
-        # Step 5: MCP Tool Call - Persist Compliance Report in Firestore
-        summary_excerpt = llm_text.splitlines()[0] if llm_text else f"{risk_assessment['status']} ({risk_assessment['risk_score']}/100)"
-        report_req = {
-            "rfp_title": rfp_title,
-            "risk_score": risk_assessment["risk_score"],
-            "summary": summary_excerpt[:400],
-        }
-        with session.record_step(
-            "mcp_tool_call",
-            "MCP Tool: submit_compliance_report",
-            {"tool": "submit_compliance_report"},
-        ) as step:
-            report_res = await self.mcp_client.submit_compliance_report(
-                rfp_title=report_req["rfp_title"],
-                risk_score=report_req["risk_score"],
-                summary=report_req["summary"],
-            )
-            call_record = {
-                "tool": "submit_compliance_report",
-                "request": report_req,
-                "response": report_res,
-            }
-            mcp_calls.append(call_record)
-            step["output"] = call_record
-        yield {"type": "step_completed", "step": step}
+        await asyncio.to_thread(session.flush)
 
         yield {
             "type": "final_result",
@@ -243,7 +260,7 @@ class EnterpriseRfpAgent:
         rfp_title: str,
         rfp_text: str,
         user_query: str = "Bewerte Machbarkeit, Compliance-Risiken und benötigte Tagessätze.",
-        model_name: str = "gemini-2.5-flash",
+        model_name: str = DEFAULT_MODEL,
     ) -> dict[str, Any]:
         """Collect all streamed events and return the final consolidated analysis dictionary."""
         final_payload: dict[str, Any] = {}
